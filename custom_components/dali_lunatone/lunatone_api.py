@@ -1735,6 +1735,25 @@ class LunatoneClient:
             )
             return False
 
+    def _dali_lights(self) -> list[DaliDevice]:
+        """Return all DALI (control gear) devices."""
+        return [device for (protocol, _), device in self._devices.items() if protocol == "DALI"]
+
+    def _apply_level_to_lights(self, devices: list[DaliDevice], level: int) -> None:
+        """Record a level sent to several lights at once and notify listeners.
+
+        Group and broadcast frames we send are not reported back as external
+        commands, so the member lights' state has to be updated here.
+        """
+        brightness = round((level / 254) * 100)
+        for device in devices:
+            if (device.is_on, device.brightness) == (level > 0, brightness):
+                continue
+            device.is_on = level > 0
+            device.brightness = brightness
+            for callback in self._callbacks:
+                callback("state_update", device)
+
     async def set_group_brightness(
         self, group_number: int, level: int, line: int = 0
     ) -> bool:
@@ -1748,6 +1767,9 @@ class LunatoneClient:
             address_byte = 0x80 | (group_number << 1)
             dali_data = [address_byte, level]
             await self._send_dali_frame(line, dali_data)
+            self._apply_level_to_lights(
+                [device for device in self._dali_lights() if group_number in device.groups], level
+            )
             
             _LOGGER.debug("Set group %d brightness to level %d", group_number, level)
             return True
@@ -1799,6 +1821,7 @@ class LunatoneClient:
             # Broadcast command: address byte = 0xFE (broadcast unaddressed)
             dali_data = [0xFE, level]
             await self._send_dali_frame(line, dali_data)
+            self._apply_level_to_lights(self._dali_lights(), level)
             
             _LOGGER.debug("Set broadcast brightness to level %d", level)
             return True

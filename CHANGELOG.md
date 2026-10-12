@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Group and broadcast lights had no state** - `DaliGroupLight` and `DaliBroadcastLight` never reported `is_on`/`brightness`, so Home Assistant showed them as unknown. They now derive state from their member lights (on if any member is on, brightness is the mean of the members that are on, as Home Assistant light groups do), and group/broadcast commands sent from Home Assistant update the member lights' tracked state.
+
 ## [0.1.4-beta-3] - 2026-03-13
 
 ### Fixed

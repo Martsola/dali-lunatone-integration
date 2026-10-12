@@ -37,6 +37,23 @@ from .lunatone_api import DaliDevice
 _LOGGER = logging.getLogger(__name__)
 
 
+def _aggregate_state(devices: list[DaliDevice]) -> tuple[bool | None, int | None]:
+    """Combine member gear state into (is_on, brightness 0-255) for a group-like entity.
+
+    On if any member is on; brightness is the mean of the members that are on,
+    matching Home Assistant's own light groups.
+    """
+    if not devices:
+        return None, None
+    levels = [device.brightness for device in devices if device.is_on]
+    if not levels:
+        return False, None
+    known = [level for level in levels if level is not None]
+    if not known:
+        return True, None
+    return True, round(sum(known) / len(known) / 100 * 255)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -465,7 +482,7 @@ class FeedbackLedLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
 class DaliGroupLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
     """Representation of a DALI group light (groups 0-15)."""
 
-    _attr_should_poll = False  # No state reporting for groups
+    _attr_should_poll = False  # State is derived from member lights
 
     def __init__(
         self,
@@ -525,6 +542,24 @@ class DaliGroupLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
             "device_count": len(devices_in_group),
         }
 
+    def _members(self) -> list[DaliDevice]:
+        """Return the DALI gear in this group."""
+        return [
+            device
+            for device in (self.coordinator.data or {}).values()
+            if device.protocol == "DALI" and self._group_number in device.groups
+        ]
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return true if any light in the group is on."""
+        return _aggregate_state(self._members())[0]
+
+    @property
+    def brightness(self) -> int | None:
+        """Return the mean brightness of the lights in the group that are on."""
+        return _aggregate_state(self._members())[1]
+
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on the group."""
         brightness = kwargs.get(ATTR_BRIGHTNESS)
@@ -559,7 +594,7 @@ class DaliGroupLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
 class DaliBroadcastLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
     """Representation of DALI broadcast control (all devices)."""
 
-    _attr_should_poll = False  # No state reporting for broadcast
+    _attr_should_poll = False  # State is derived from all lights
 
     def __init__(
         self,
@@ -610,6 +645,24 @@ class DaliBroadcastLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
             "description": "Controls all DALI devices simultaneously",
             "device_count": dali_device_count,
         }
+
+    def _members(self) -> list[DaliDevice]:
+        """Return all DALI gear."""
+        return [
+            device
+            for device in (self.coordinator.data or {}).values()
+            if device.protocol == "DALI"
+        ]
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return true if any DALI light is on."""
+        return _aggregate_state(self._members())[0]
+
+    @property
+    def brightness(self) -> int | None:
+        """Return the mean brightness of the DALI lights that are on."""
+        return _aggregate_state(self._members())[1]
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on all devices via broadcast."""
