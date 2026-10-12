@@ -53,7 +53,18 @@ CMD_STEP_UP: Final = 3
 CMD_STEP_DOWN: Final = 4
 CMD_RECALL_MAX: Final = 5
 CMD_RECALL_MIN: Final = 6
+CMD_STEP_DOWN_AND_OFF: Final = 7
+CMD_ON_AND_STEP_UP: Final = 8
 CMD_GO_TO_LAST: Final = 10
+CMD_CONTINUOUS_UP: Final = 11  # DALI-2
+CMD_CONTINUOUS_DOWN: Final = 12  # DALI-2
+CMD_GO_TO_SCENE_0: Final = 16
+CMD_GO_TO_SCENE_15: Final = 31
+DALI_MASK: Final = 255  # DAPC "no change"
+
+# Delay after the last external command before re-querying the affected gear.
+# Lets fades and long-press dimming (repeated UP/DOWN frames) settle first.
+EXTERNAL_REFRESH_DELAY: Final = 1.5
 CMD_QUERY_STATUS: Final = 144
 CMD_QUERY_DEVICE_TYPE: Final = 153
 CMD_QUERY_NEXT_DEVICE_TYPE: Final = 167  # DALI-2: IEC 62386-102 §Table 15 cmd 0xA7 (verified via Lunatone DALI Cockpit capture)

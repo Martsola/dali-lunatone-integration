@@ -11,9 +11,16 @@ from websockets.client import WebSocketClientProtocol
 
 from .const import (
     CMD_ACTIVATE,
+    CMD_CONTINUOUS_DOWN,
+    CMD_CONTINUOUS_UP,
+    CMD_DOWN,
     CMD_DT8_QUERY_COLOUR_TYPE,
     CMD_ENABLE_DT8,
+    CMD_GO_TO_LAST,
+    CMD_GO_TO_SCENE_0,
+    CMD_GO_TO_SCENE_15,
     CMD_OFF,
+    CMD_ON_AND_STEP_UP,
     CMD_QUERY_ACTUAL_LEVEL,
     CMD_QUERY_CONTENT_DTR,
     CMD_QUERY_DEVICE_CAPABILITIES,
@@ -27,15 +34,20 @@ from .const import (
     CMD_QUERY_NUMBER_OF_INSTANCES,
     CMD_QUERY_STATUS,
     CMD_READ_MEMORY_LOCATION,
+    CMD_RECALL_MAX,
     CMD_RECALL_MAX_LEVEL,
+    CMD_RECALL_MIN,
     CMD_SET_DTR0,
     CMD_SET_DTR1,
     CMD_SET_TEMP_COLOR_TEMP,
     CMD_STEP_DOWN,
+    CMD_STEP_DOWN_AND_OFF,
     CMD_STEP_UP,
     CMD_STORE_ACTUAL_LEVEL_IN_DTR,
     CMD_UP,
     CONNECTION_TIMEOUT,
+    DALI_MASK,
+    EXTERNAL_REFRESH_DELAY,
     FEATURE_TYPES,
     FEEDBACK_LED_OFF,
     FEEDBACK_LED_ON,
@@ -275,6 +287,9 @@ class LunatoneClient:
         self._pending_requests: dict[int, asyncio.Future] = {}
         self._response_queue: asyncio.Queue = asyncio.Queue()  # Queue for daliFrame responses
         self._recent_monitor_frames: dict[str, float] = {}  # Cache for deduplicating daliMonitor frames
+        self._pending_refresh: set[int] = set()  # Short addresses to re-query after external commands
+        self._refresh_due: float = 0.0
+        self._refresh_task: asyncio.Task | None = None
 
     @property
     def connected(self) -> bool:
@@ -365,6 +380,14 @@ class LunatoneClient:
             except asyncio.CancelledError:
                 pass
 
+        if self._refresh_task:
+            self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
+        self._pending_refresh.clear()
+
         # Close WebSocket
         if self._ws:
             await self._ws.close()
@@ -451,7 +474,10 @@ class LunatoneClient:
                 # Only process external commands (not our own queries)
                 is_external = frame_data.get("externalSource", False)
                 is_query = frame_data.get("query", False)
-                if is_external and not is_query:
+                # Devices are only scanned on line 0, so frames from other lines
+                # would be attributed to the wrong gear
+                on_scanned_line = frame_data.get("line", 0) == 0
+                if is_external and not is_query and on_scanned_line:
                     event_data = {"daliData": dali_data}
                     await self._handle_dali_command(event_data)
             return
@@ -609,63 +635,118 @@ class LunatoneClient:
         from .const import BUTTON_EVENT_TYPES
         return BUTTON_EVENT_TYPES.get(event_type, f"unknown_event_{event_type}")
 
+    def _resolve_command_targets(self, address_byte: int) -> list[DaliDevice] | None:
+        """Return the DALI gear addressed by the address byte of a forward frame.
+
+        Returns None for special commands (0xA0-0xFD), which do not address gear.
+        """
+        lights = [device for (protocol, _), device in self._devices.items() if protocol == "DALI"]
+        if address_byte <= 0x7F:  # Short address: 0AAAAAAS
+            address = address_byte >> 1
+            return [device for device in lights if device.address == address]
+        if address_byte <= 0x9F:  # Group address: 100GGGGS
+            group_number = (address_byte >> 1) & 0x0F
+            return [device for device in lights if group_number in device.groups]
+        if address_byte >= 0xFE:  # Broadcast: 1111111S
+            return lights
+        return None
+
+    def _apply_external_state(
+        self, devices: list[DaliDevice], is_on: bool, brightness: int | None
+    ) -> None:
+        """Update tracked state of gear changed by an external command and notify."""
+        for device in devices:
+            old_state = (device.is_on, device.brightness)
+            device.is_on = is_on
+            if brightness is not None:
+                device.brightness = brightness
+            elif is_on and not device.brightness:
+                # Turned on to a level we don't know yet; the scheduled refresh fills it in
+                device.brightness = None
+            if (device.is_on, device.brightness) != old_state:
+                for callback in self._callbacks:
+                    callback("state_update", device)
+
     async def _handle_dali_command(self, data: dict[str, Any]) -> None:
-        """Handle DALI command notifications from the bus (external device control)."""
+        """Handle DALI command notifications from the bus (external device control).
+
+        Commands with a known outcome (DAPC, OFF) update state immediately. Commands
+        whose resulting level depends on gear settings (RECALL MAX/MIN, scenes, steps,
+        dimming) schedule a re-query of only the addressed gear.
+        """
         dali_data = data.get("daliData", [])
         if not dali_data or len(dali_data) != 2:
             return
 
-        first_byte = dali_data[0]
-        second_byte = dali_data[1]
+        address_byte, opcode = dali_data
+        targets = self._resolve_command_targets(address_byte)
+        if not targets:
+            return
 
-        # Check if it's a group command (bit 7 = 1, LSB = 0 for direct arc)
-        # This check must come FIRST because group commands also have LSB = 0
-        if (first_byte & 0x80) == 0x80 and (first_byte & 0x01) == 0:
-            group_number = (first_byte >> 1) & 0x0F  # Bits 1-4 contain group number (0-15)
-            level = second_byte
+        # Direct arc power control (S bit = 0): the second byte is the target level
+        if (address_byte & 0x01) == 0:
+            if opcode == DALI_MASK:
+                return
+            _LOGGER.debug(
+                "External DAPC: address byte 0x%02X, level=%d, %d device(s)",
+                address_byte, opcode, len(targets),
+            )
+            self._apply_external_state(targets, opcode > 0, round((opcode / 254) * 100))
+            return
 
-            if level <= 254 and group_number <= 15:  # Validate group number
-                # Find all devices in this group and update them
-                for device_key, device in self._devices.items():
-                    protocol, address = device_key
-                    if protocol == "DALI" and group_number in device.groups:
-                        old_brightness = device.brightness
-                        old_is_on = device.is_on
-                        
-                        device.brightness = round((level / 254) * 100)
-                        device.is_on = level > 0
-                        
-                        if device.brightness != old_brightness or device.is_on != old_is_on:
-                            _LOGGER.info("External DALI group command: group=%d, address=%d, level=%d", 
-                                        group_number, address, level)
-                            
-                            # Notify callbacks
-                            for callback in self._callbacks:
-                                callback("state_update", device)
-        
-        # Check if it's a direct arc command to a device (LSB = 0, bit 7 = 0)
-        elif (first_byte & 0x01) == 0:
-            address = first_byte >> 1
-            level = second_byte
+        if opcode == CMD_OFF:
+            _LOGGER.debug("External OFF: address byte 0x%02X, %d device(s)", address_byte, len(targets))
+            self._apply_external_state(targets, False, 0)
+        elif opcode in (CMD_RECALL_MAX, CMD_RECALL_MIN, CMD_ON_AND_STEP_UP, CMD_GO_TO_LAST):
+            _LOGGER.debug(
+                "External ON-type command %d: address byte 0x%02X, %d device(s)",
+                opcode, address_byte, len(targets),
+            )
+            self._apply_external_state(targets, True, None)
+            self._schedule_refresh(targets)
+        elif opcode in (
+            CMD_UP,
+            CMD_DOWN,
+            CMD_STEP_UP,
+            CMD_STEP_DOWN,
+            CMD_STEP_DOWN_AND_OFF,
+            CMD_CONTINUOUS_UP,
+            CMD_CONTINUOUS_DOWN,
+        ) or CMD_GO_TO_SCENE_0 <= opcode <= CMD_GO_TO_SCENE_15:
+            _LOGGER.debug(
+                "External level command %d: address byte 0x%02X, %d device(s)",
+                opcode, address_byte, len(targets),
+            )
+            self._schedule_refresh(targets)
 
-            # Only process if it's a valid level and we know the device
-            device_key = ("DALI", address)
-            if device_key in self._devices and level <= 254:
-                device = self._devices[device_key]
-                old_brightness = device.brightness
-                old_is_on = device.is_on
-                
-                device.brightness = round((level / 254) * 100)
-                device.is_on = level > 0
-                
-                # Only notify if state actually changed
-                if device.brightness != old_brightness or device.is_on != old_is_on:
-                    _LOGGER.info("External DALI command: address=%d, level=%d, brightness=%d%%", 
-                                address, level, device.brightness)
-                    
-                    # Notify callbacks
-                    for callback in self._callbacks:
-                        callback("state_update", device)
+    def _schedule_refresh(self, devices: list[DaliDevice]) -> None:
+        """Re-query the given gear once external commands have been quiet for a moment."""
+        self._pending_refresh.update(device.address for device in devices)
+        self._refresh_due = asyncio.get_running_loop().time() + EXTERNAL_REFRESH_DELAY
+        # The message handler must not wait for query answers itself (it is what
+        # receives them), so the queries run in their own task
+        if self._refresh_task is None or self._refresh_task.done():
+            self._refresh_task = asyncio.create_task(self._run_external_refresh())
+
+    async def _run_external_refresh(self) -> None:
+        """Query actual levels for gear touched by external commands."""
+        loop = asyncio.get_running_loop()
+        while self._pending_refresh:
+            # Commands arriving while waiting push the deadline out (debounce)
+            while (remaining := self._refresh_due - loop.time()) > 0:
+                await asyncio.sleep(remaining)
+
+            addresses = sorted(self._pending_refresh)
+            self._pending_refresh.clear()
+            for address in addresses:
+                device = self._devices.get(("DALI", address))
+                if device is None or not self.connected:
+                    continue
+                brightness = await self.query_brightness(address)
+                if brightness is None:
+                    _LOGGER.debug("External refresh: no answer from address %d", address)
+                    continue
+                self._apply_external_state([device], brightness > 0, brightness)
 
     async def _reconnect(self) -> None:
         """Attempt to reconnect to Lunatone."""
