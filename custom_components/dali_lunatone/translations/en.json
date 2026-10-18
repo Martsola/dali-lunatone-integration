@@ -24,11 +24,13 @@
         "title": "Lunatone DALI-2 IoT Options",
         "description": "Configure device scanning and polling behavior.",
         "data": {
+          "dali_lines": "DALI lines",
           "background_status_polling": "Enable background status polling",
           "polling_interval": "Polling interval (seconds)",
           "scan_new_devices_on_startup": "Scan for new devices on startup"
         },
         "data_description": {
+          "dali_lines": "DALI lines (buses) of the gateway to scan and follow. A DALI-2 IoT4 has lines 0-3. Run a manual scan after changing this.",
           "background_status_polling": "Automatically poll device states in the background. Device state changes from physical buttons are detected in real-time via WebSocket regardless of this setting.",
           "polling_interval": "How often to poll device states when background polling is enabled (300-86400 seconds, default 1800 = 30 minutes). Only applies if background polling is enabled.",
           "scan_new_devices_on_startup": "Automatically scan for new, changed, or removed devices when Home Assistant starts. Use the Manual Scan button to discover devices on demand."

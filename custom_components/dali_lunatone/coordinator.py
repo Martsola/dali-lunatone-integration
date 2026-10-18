@@ -11,7 +11,15 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import CONF_BACKGROUND_STATUS_POLLING, CONF_POLLING_INTERVAL, DALI_EVENT, DEFAULT_POLLING_INTERVAL, DOMAIN
+from .const import (
+    CONF_BACKGROUND_STATUS_POLLING,
+    CONF_DALI_LINES,
+    CONF_POLLING_INTERVAL,
+    DALI_EVENT,
+    DEFAULT_DALI_LINES,
+    DEFAULT_POLLING_INTERVAL,
+    DOMAIN,
+)
 from .lunatone_api import DaliDevice, LunatoneClient
 from .storage import DeviceStorage
 
@@ -39,6 +47,10 @@ class LunatoneCoordinator(DataUpdateCoordinator[dict[tuple[str, int], DaliDevice
             update_interval=timedelta(seconds=polling_interval) if background_polling else None,
         )
         self.client = client
+        # Options store the selected lines as strings (multi-select keys)
+        self.client.lines = sorted(
+            int(line) for line in config_entry.options.get(CONF_DALI_LINES, DEFAULT_DALI_LINES)
+        ) or list(DEFAULT_DALI_LINES)
         self.storage = DeviceStorage(hass, entry_id)
         self._devices_loaded = False
         self._background_polling = background_polling
@@ -165,7 +177,7 @@ class LunatoneCoordinator(DataUpdateCoordinator[dict[tuple[str, int], DaliDevice
         
         try:
             # Perform scan
-            devices = await self.client.scan_devices()
+            devices = await self.client.scan_all_lines()
         except ConnectionError as e:
             _LOGGER.error("Cannot rescan: %s", e)
             self._scan_in_progress = False

@@ -10,6 +10,14 @@ CONF_PORT: Final = "port"
 CONF_BACKGROUND_STATUS_POLLING: Final = "background_status_polling"
 CONF_POLLING_INTERVAL: Final = "polling_interval"
 CONF_SCAN_NEW_DEVICES_ON_STARTUP: Final = "scan_new_devices_on_startup"
+CONF_DALI_LINES: Final = "dali_lines"
+DEFAULT_DALI_LINES: Final = [0]
+DALI_LINE_COUNT: Final = 4  # DALI-2 IoT4 has four lines (0-3)
+
+# Devices on line N are keyed by address N * DALI_LINE_SPAN + short address, so
+# line 0 keeps its plain 0-63 addresses (and its existing unique IDs) and the
+# same short address on different lines cannot collide.
+DALI_LINE_SPAN: Final = 64
 DEFAULT_PORT: Final = 80
 DEFAULT_NAME: Final = "Lunatone DALI"
 DEFAULT_POLLING_INTERVAL: Final = 1800  # 30 minutes in seconds
@@ -53,7 +61,18 @@ CMD_STEP_UP: Final = 3
 CMD_STEP_DOWN: Final = 4
 CMD_RECALL_MAX: Final = 5
 CMD_RECALL_MIN: Final = 6
+CMD_STEP_DOWN_AND_OFF: Final = 7
+CMD_ON_AND_STEP_UP: Final = 8
 CMD_GO_TO_LAST: Final = 10
+CMD_CONTINUOUS_UP: Final = 11  # DALI-2
+CMD_CONTINUOUS_DOWN: Final = 12  # DALI-2
+CMD_GO_TO_SCENE_0: Final = 16
+CMD_GO_TO_SCENE_15: Final = 31
+DALI_MASK: Final = 255  # DAPC "no change"
+
+# Delay after the last external command before re-querying the affected gear.
+# Lets fades and long-press dimming (repeated UP/DOWN frames) settle first.
+EXTERNAL_REFRESH_DELAY: Final = 1.5
 CMD_QUERY_STATUS: Final = 144
 CMD_QUERY_DEVICE_TYPE: Final = 153
 CMD_QUERY_NEXT_DEVICE_TYPE: Final = 167  # DALI-2: IEC 62386-102 §Table 15 cmd 0xA7 (verified via Lunatone DALI Cockpit capture)

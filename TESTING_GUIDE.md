@@ -241,3 +241,18 @@ Once testing is complete and successful:
 5. Create v0.1.0-beta release
 6. Share with community for wider testing
 7. Plan for v1.0.0 stable release after beta period
+
+## Unit tests
+
+The DALI client (`lunatone_api.py`) has unit tests that run without Home Assistant
+or a gateway. They need Python 3.12+ (the same as Home Assistant).
+
+```bash
+python3 -m venv venv
+venv/bin/pip install -r requirements_test.txt
+venv/bin/python -m pytest tests
+```
+
+- `tests/test_external_commands.py` - following commands from wall buttons and other bus masters
+- `tests/test_multi_line.py` - multi-line (multi-bus) support
+

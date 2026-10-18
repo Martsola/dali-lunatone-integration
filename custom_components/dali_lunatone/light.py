@@ -32,9 +32,44 @@ from .const import (
     MIN_COLOR_TEMP_KELVIN,
 )
 from .coordinator import LunatoneCoordinator
-from .lunatone_api import DaliDevice
+from .lunatone_api import DaliDevice, bus_model, device_label, line_device_identifier, split_address
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _aggregate_state(devices: list[DaliDevice]) -> tuple[bool | None, int | None]:
+    """Combine member gear state into (is_on, brightness 0-255) for a group-like entity.
+
+    On if any member is on; brightness is the mean of the members that are on,
+    matching Home Assistant's own light groups.
+    """
+    if not devices:
+        return None, None
+    levels = [device.brightness for device in devices if device.is_on]
+    if not levels:
+        return False, None
+    known = [level for level in levels if level is not None]
+    if not known:
+        return True, None
+    return True, round(sum(known) / len(known) / 100 * 255)
+
+
+def _groups_device_info(entry: ConfigEntry, line: int) -> DeviceInfo:
+    """Return the device that holds the group/broadcast lights of a DALI line."""
+    via = (DOMAIN, line_device_identifier(entry.entry_id, line))
+    if line == 0:
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"{entry.entry_id}_groups")},
+            name="DALI Groups",
+            model=f"Bus {line} · DALI Group Controller",
+            via_device=via,
+        )
+    return DeviceInfo(
+        identifiers={(DOMAIN, f"{entry.entry_id}_L{line}_groups")},
+        name=f"DALI Line {line} Groups",
+        model=f"Bus {line} · DALI Group Controller",
+        via_device=via,
+    )
 
 
 async def async_setup_entry(
@@ -96,19 +131,22 @@ async def async_setup_entry(
     entry.async_on_unload(coordinator.async_add_listener(_async_check_new_light_entities))
 
     # Find groups with devices
-    groups_with_devices = set()
+    # DALI groups are per line: group 1 on line 0 and group 1 on line 1 are different
+    groups_with_devices: set[tuple[int, int]] = set()
     for device in coordinator.data.values():
         if device.protocol == "DALI" and device.groups:
-            groups_with_devices.update(device.groups)
+            groups_with_devices.update((device.line, group) for group in device.groups)
 
     # Create group light entities for groups 0-15 that have devices
     group_entities = []
-    for group_num in sorted(groups_with_devices):
+    for line, group_num in sorted(groups_with_devices):
         if group_num <= 15:
-            group_entities.append(DaliGroupLight(coordinator, client, group_num, entry))
+            group_entities.append(DaliGroupLight(coordinator, client, group_num, entry, line))
     
-    # Add broadcast entity
-    group_entities.append(DaliBroadcastLight(coordinator, client, entry))
+    # Add a broadcast entity for line 0 (always, as before) and every other line with lights
+    light_lines = {device.line for device in coordinator.data.values() if device.protocol == "DALI"}
+    for line in sorted(light_lines | {0}):
+        group_entities.append(DaliBroadcastLight(coordinator, client, entry, line))
     
     if group_entities:
         async_add_entities(group_entities)
@@ -155,7 +193,7 @@ class LunatoneDaliLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
         
         self._attr_unique_id = f"{entry.entry_id}_{protocol}_{address}"
         # Set name in format: "DALI Address 4" or "DALI2 Address 0"
-        self._attr_name = f"{protocol} Address {address}"
+        self._attr_name = device_label(protocol, address)
 
         # Default to brightness-only; _update_color_mode upgrades to CCT if DT8
         self._attr_supported_color_modes = {ColorMode.BRIGHTNESS}
@@ -191,13 +229,13 @@ class LunatoneDaliLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
         
         # Build model label: show all types for multi-type devices, e.g. "DALI DT6,8"
         types_label = device.device_types_label if hasattr(device, "device_types_label") else f"DT{device.device_type}"
-        model_label = f"{protocol} {types_label}"
+        model_label = bus_model(address, f"{protocol} {types_label}")
 
         device_info_dict = DeviceInfo(
             identifiers={(DOMAIN, f"{protocol}_{address}")},
-            name=f"{protocol} Address {address}",
+            name=device_label(protocol, address),
             model=model_label,
-            via_device=(DOMAIN, self.coordinator.config_entry.entry_id),
+            via_device=(DOMAIN, line_device_identifier(self.coordinator.config_entry.entry_id, split_address(self._address)[0])),
         )
         
         # Add extended device information if available
@@ -245,6 +283,8 @@ class LunatoneDaliLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
         attrs: dict[str, Any] = {
             ATTR_ADDRESS: self._address,
             ATTR_PROTOCOL: self._protocol,
+            "dali_line": split_address(self._address)[0],
+            "short_address": split_address(self._address)[1],
             ATTR_DEVICE_TYPE: self._device.device_type,
             ATTR_DEVICE_NAME: self._device.device_name,
         }
@@ -370,13 +410,13 @@ class FeedbackLedLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
     def device_info(self) -> DeviceInfo:
         """Return device info."""
         device = (self.coordinator.data or {}).get(self._device_key)
-        model = device.device_name if device else "DALI2 Device"
+        model = bus_model(self._address, device.device_name if device else "DALI2 Device")
 
         device_info_dict = DeviceInfo(
             identifiers={(DOMAIN, f"{self._protocol}_{self._address}")},
-            name=f"{self._protocol} Address {self._address}",
+            name=device_label(self._protocol, self._address),
             model=model,
-            via_device=(DOMAIN, self.coordinator.config_entry.entry_id),
+            via_device=(DOMAIN, line_device_identifier(self.coordinator.config_entry.entry_id, split_address(self._address)[0])),
         )
 
         if device:
@@ -465,7 +505,7 @@ class FeedbackLedLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
 class DaliGroupLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
     """Representation of a DALI group light (groups 0-15)."""
 
-    _attr_should_poll = False  # No state reporting for groups
+    _attr_should_poll = False  # State is derived from member lights
 
     def __init__(
         self,
@@ -473,18 +513,30 @@ class DaliGroupLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
         client,
         group_number: int,
         entry: ConfigEntry,
+        line: int = 0,
     ) -> None:
         """Initialize the group light."""
         super().__init__(coordinator)
         self._client = client
         self._group_number = group_number
-        self._attr_unique_id = f"{entry.entry_id}_group_{group_number}"
-        self._attr_name = f"DALI Group {group_number}"
+        self._line = line
+        # Line 0 keeps its original unique ID and name
+        if line == 0:
+            self._attr_unique_id = f"{entry.entry_id}_group_{group_number}"
+            self._attr_name = f"DALI Group {group_number}"
+        else:
+            self._attr_unique_id = f"{entry.entry_id}_L{line}_group_{group_number}"
+            self._attr_name = f"DALI Line {line} Group {group_number}"
         
         # Check if any device in this group supports color temp
         supports_color_temp = False
         for device in coordinator.data.values():
-            if device.protocol == "DALI" and device.groups and group_number in device.groups:
+            if (
+                device.protocol == "DALI"
+                and device.line == line
+                and device.groups
+                and group_number in device.groups
+            ):
                 if device.supports_color_temp:
                     supports_color_temp = True
                     break
@@ -499,12 +551,8 @@ class DaliGroupLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
             self._attr_supported_color_modes = {ColorMode.BRIGHTNESS}
             self._attr_color_mode = ColorMode.BRIGHTNESS
         
-        # Device info for DALI Groups
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"{entry.entry_id}_groups")},
-            name="DALI Groups",
-            model="DALI Group Controller",
-        )
+        # Device info for DALI Groups (one device per line)
+        self._attr_device_info = _groups_device_info(entry, line)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -512,7 +560,12 @@ class DaliGroupLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
         # List devices in this group
         devices_in_group = []
         for (protocol, address), device in self.coordinator.data.items():
-            if protocol == "DALI" and device.groups and self._group_number in device.groups:
+            if (
+                protocol == "DALI"
+                and device.line == self._line
+                and device.groups
+                and self._group_number in device.groups
+            ):
                 devices_in_group.append({
                     "address": address,
                     "device_type": device.device_type,
@@ -521,9 +574,30 @@ class DaliGroupLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
         
         return {
             "group_number": self._group_number,
+            "line": self._line,
             "devices": devices_in_group,
             "device_count": len(devices_in_group),
         }
+
+    def _members(self) -> list[DaliDevice]:
+        """Return the DALI gear in this group."""
+        return [
+            device
+            for device in (self.coordinator.data or {}).values()
+            if device.protocol == "DALI"
+            and device.line == self._line
+            and self._group_number in device.groups
+        ]
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return true if any light in the group is on."""
+        return _aggregate_state(self._members())[0]
+
+    @property
+    def brightness(self) -> int | None:
+        """Return the mean brightness of the lights in the group that are on."""
+        return _aggregate_state(self._members())[1]
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on the group."""
@@ -535,20 +609,20 @@ class DaliGroupLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
             kelvin = max(
                 MIN_COLOR_TEMP_KELVIN, min(MAX_COLOR_TEMP_KELVIN, color_temp_kelvin)
             )
-            await self._client.set_group_color_temp(self._group_number, kelvin)
+            await self._client.set_group_color_temp(self._group_number, kelvin, self._line)
 
         # Handle brightness change or turn on
         if brightness is not None:
             # Convert from 0-255 to 0-254 DALI level
             dali_level = round((brightness / 255) * 254)
-            await self._client.set_group_brightness(self._group_number, dali_level)
+            await self._client.set_group_brightness(self._group_number, dali_level, self._line)
         elif color_temp_kelvin is None:
             # Only turn on to max if neither brightness nor color temp was specified
-            await self._client.set_group_brightness(self._group_number, 254)
+            await self._client.set_group_brightness(self._group_number, 254, self._line)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn off the group."""
-        await self._client.set_group_brightness(self._group_number, 0)
+        await self._client.set_group_brightness(self._group_number, 0, self._line)
 
     @property
     def available(self) -> bool:
@@ -559,25 +633,32 @@ class DaliGroupLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
 class DaliBroadcastLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
     """Representation of DALI broadcast control (all devices)."""
 
-    _attr_should_poll = False  # No state reporting for broadcast
+    _attr_should_poll = False  # State is derived from all lights
 
     def __init__(
         self,
         coordinator: LunatoneCoordinator,
         client,
         entry: ConfigEntry,
+        line: int = 0,
     ) -> None:
         """Initialize the broadcast light."""
         super().__init__(coordinator)
         self._client = client
-        self._attr_unique_id = f"{entry.entry_id}_broadcast"
-        self._attr_name = "DALI Broadcast (All Devices)"
+        self._line = line
+        # Line 0 keeps its original unique ID and name
+        if line == 0:
+            self._attr_unique_id = f"{entry.entry_id}_broadcast"
+            self._attr_name = "DALI Broadcast (All Devices)"
+        else:
+            self._attr_unique_id = f"{entry.entry_id}_L{line}_broadcast"
+            self._attr_name = f"DALI Line {line} Broadcast (All Devices)"
         
         # Check if any device supports color temp
         supports_color_temp = any(
             device.supports_color_temp
             for device in coordinator.data.values()
-            if device.protocol == "DALI"
+            if device.protocol == "DALI" and device.line == line
         )
         
         # COLOR_TEMP implies brightness control — never combine with BRIGHTNESS
@@ -590,12 +671,8 @@ class DaliBroadcastLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
             self._attr_supported_color_modes = {ColorMode.BRIGHTNESS}
             self._attr_color_mode = ColorMode.BRIGHTNESS
         
-        # Device info for DALI Groups
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"{entry.entry_id}_groups")},
-            name="DALI Groups",
-            model="DALI Group Controller",
-        )
+        # Device info for DALI Groups (one device per line)
+        self._attr_device_info = _groups_device_info(entry, line)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -603,13 +680,32 @@ class DaliBroadcastLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
         # Count DALI devices
         dali_device_count = sum(
             1 for device in self.coordinator.data.values()
-            if device.protocol == "DALI"
+            if device.protocol == "DALI" and device.line == self._line
         )
         
         return {
-            "description": "Controls all DALI devices simultaneously",
+            "description": f"Controls all DALI devices on line {self._line} simultaneously",
+            "line": self._line,
             "device_count": dali_device_count,
         }
+
+    def _members(self) -> list[DaliDevice]:
+        """Return all DALI gear on this line."""
+        return [
+            device
+            for device in (self.coordinator.data or {}).values()
+            if device.protocol == "DALI" and device.line == self._line
+        ]
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return true if any DALI light is on."""
+        return _aggregate_state(self._members())[0]
+
+    @property
+    def brightness(self) -> int | None:
+        """Return the mean brightness of the DALI lights that are on."""
+        return _aggregate_state(self._members())[1]
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on all devices via broadcast."""
@@ -621,20 +717,20 @@ class DaliBroadcastLight(CoordinatorEntity[LunatoneCoordinator], LightEntity):
             kelvin = max(
                 MIN_COLOR_TEMP_KELVIN, min(MAX_COLOR_TEMP_KELVIN, color_temp_kelvin)
             )
-            await self._client.set_broadcast_color_temp(kelvin)
+            await self._client.set_broadcast_color_temp(kelvin, self._line)
 
         # Handle brightness change or turn on
         if brightness is not None:
             # Convert from 0-255 to 0-254 DALI level
             dali_level = round((brightness / 255) * 254)
-            await self._client.set_broadcast_brightness(dali_level)
+            await self._client.set_broadcast_brightness(dali_level, self._line)
         elif color_temp_kelvin is None:
             # Only turn on to max if neither brightness nor color temp was specified
-            await self._client.set_broadcast_brightness(254)
+            await self._client.set_broadcast_brightness(254, self._line)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn off all devices via broadcast."""
-        await self._client.set_broadcast_brightness(0)
+        await self._client.set_broadcast_brightness(0, self._line)
 
     @property
     def available(self) -> bool:

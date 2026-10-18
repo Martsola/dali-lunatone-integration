@@ -15,8 +15,11 @@ import homeassistant.helpers.config_validation as cv
 
 from .const import (
     CONF_BACKGROUND_STATUS_POLLING,
+    CONF_DALI_LINES,
     CONF_POLLING_INTERVAL,
     CONF_SCAN_NEW_DEVICES_ON_STARTUP,
+    DALI_LINE_COUNT,
+    DEFAULT_DALI_LINES,
     DEFAULT_NAME,
     DEFAULT_POLLING_INTERVAL,
     DEFAULT_PORT,
@@ -142,6 +145,13 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                         DEFAULT_POLLING_INTERVAL,
                     ),
                 ): vol.All(vol.Coerce(int), vol.Range(min=MIN_POLLING_INTERVAL, max=MAX_POLLING_INTERVAL)),
+                vol.Optional(
+                    CONF_DALI_LINES,
+                    default=[
+                        str(line)
+                        for line in self.config_entry.options.get(CONF_DALI_LINES, DEFAULT_DALI_LINES)
+                    ],
+                ): cv.multi_select({str(line): f"Line {line}" for line in range(DALI_LINE_COUNT)}),
                 vol.Optional(
                     CONF_SCAN_NEW_DEVICES_ON_STARTUP,
                     default=self.config_entry.options.get(

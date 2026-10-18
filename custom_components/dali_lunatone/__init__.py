@@ -21,7 +21,7 @@ from .const import (
     PLATFORMS,
 )
 from .coordinator import LunatoneCoordinator
-from .lunatone_api import LunatoneClient
+from .lunatone_api import LunatoneClient, line_device_identifier
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -81,6 +81,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         sw_version=gateway_info.get("version", "Unknown"),
         configuration_url=f"http://{host}:{port}",
     )
+
+    # One "DALI Bus N" device per line, between the gateway and the line's DALI devices,
+    # so each device shows which bus it is on. Includes lines that still have stored devices.
+    bus_lines = set(client.lines) | {device.line for device in (coordinator.data or {}).values()}
+    for line in sorted(bus_lines):
+        device_registry.async_get_or_create(
+            config_entry_id=entry.entry_id,
+            identifiers={(DOMAIN, line_device_identifier(entry.entry_id, line))},
+            name=f"DALI Bus {line}",
+            manufacturer="Lunatone",
+            model="DALI line",
+            via_device=(DOMAIN, entry.entry_id),
+        )
 
     # Set up platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

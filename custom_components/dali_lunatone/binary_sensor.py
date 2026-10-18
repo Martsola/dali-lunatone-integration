@@ -13,6 +13,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .lunatone_api import device_label, bus_model, line_device_identifier, split_address
 from .const import DOMAIN, FEATURE_TYPES
 from .coordinator import LunatoneCoordinator
 
@@ -113,9 +114,12 @@ class DaliBinarySensor(CoordinatorEntity, BinarySensorEntity):
         device_key = (self._protocol, self._address)
         device_info_dict = {
             "identifiers": {(DOMAIN, f"{self._protocol}_{self._address}")},
-            "name": f"{self._protocol} Address {self._address}",
-            "model": self._device.device_name,
-            "via_device": (DOMAIN, self.coordinator.config_entry.entry_id),
+            "name": device_label(self._protocol, self._address),
+            "model": bus_model(self._address, self._device.device_name),
+            "via_device": (
+                DOMAIN,
+                line_device_identifier(self.coordinator.config_entry.entry_id, split_address(self._address)[0]),
+            ),
         }
         
         # Try to get fresh device data from coordinator
@@ -125,7 +129,7 @@ class DaliBinarySensor(CoordinatorEntity, BinarySensorEntity):
             if hasattr(device, "manufacturer") and device.manufacturer:
                 device_info_dict["manufacturer"] = device.manufacturer
             if hasattr(device, "gtin_decimal") and device.gtin_decimal:
-                device_info_dict["model"] = f"{device.device_name} (GTIN: {device.gtin_decimal})"
+                device_info_dict["model"] = bus_model(self._address, f"{device.device_name} (GTIN: {device.gtin_decimal})")
             if hasattr(device, "firmware_version") and device.firmware_version:
                 device_info_dict["sw_version"] = device.firmware_version
             if hasattr(device, "hardware_version") and device.hardware_version:
